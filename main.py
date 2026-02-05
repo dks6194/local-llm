@@ -1,16 +1,23 @@
 import json
 import uuid
 import os
+import calendar
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional, Generator
+from typing import List, Optional, Generator, Any, Dict
 
+import requests
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import ollama
+
+# Load environment variables
+load_dotenv()
+NEWSDATA_API_KEY = os.getenv("NEWSDATA_API_KEY", "")
 
 app = FastAPI(title="Ollama Chat")
 
@@ -28,9 +35,253 @@ SAVED_CHATS_DIR = Path("./saved_chats")
 SAVED_CHATS_DIR.mkdir(parents=True, exist_ok=True)
 
 MODELS = {
-    "general": "qwen2.5:3b",
+    "general": "qwen3:1.7b",
     "code": "qwen2.5-coder:3b"
 }
+
+# ============================================================================
+# TOOLS DEFINITION
+# ============================================================================
+
+def get_current_time(timezone: str = "local") -> str:
+    """Get the current time."""
+    now = datetime.now()
+    return now.strftime("%H:%M:%S")
+
+def get_current_date(format: str = "full") -> str:
+    """Get the current date."""
+    now = datetime.now()
+    if format == "short":
+        return now.strftime("%Y-%m-%d")
+    elif format == "long":
+        return now.strftime("%B %d, %Y")
+    else:  # full
+        return now.strftime("%A, %B %d, %Y")
+
+def get_day_of_week() -> str:
+    """Get the current day of the week."""
+    return datetime.now().strftime("%A")
+
+def get_calendar_month(year: int = None, month: int = None) -> str:
+    """Get a text calendar for a specific month."""
+    now = datetime.now()
+    year = year or now.year
+    month = month or now.month
+    return calendar.month(year, month)
+
+def get_timestamp() -> str:
+    """Get the current Unix timestamp."""
+    return str(int(datetime.now().timestamp()))
+
+def get_latest_news(category: str = None, country: str = "in", max_results: int = 5, language: str = "en") -> str:
+    """Fetch latest news headlines from newsdata.io API."""
+    if not NEWSDATA_API_KEY:
+        return "Error: NEWSDATA_API_KEY not configured in .env file"
+    
+    try:
+        url = "https://newsdata.io/api/1/latest"
+        params = {
+            "apikey": NEWSDATA_API_KEY,
+            "country": country,
+            "language": language
+        }
+        
+        if category:
+            params["category"] = category
+        
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        
+        if data.get("status") != "success":
+            error_msg = data.get("results", {})
+            if isinstance(error_msg, dict):
+                error_msg = error_msg.get("message", "Unknown error")
+            return f"Error from news API: {error_msg}"
+        
+        articles = data.get("results", [])
+        
+        # Filter out duplicates
+        articles = [a for a in articles if not a.get("duplicate", False)][:max_results]
+        
+        if not articles:
+            return "No news articles found."
+        
+        # Format news for readability
+        news_output = []
+        for i, article in enumerate(articles, 1):
+            title = article.get("title", "No title")
+            source = article.get("source_name", article.get("source_id", "Unknown"))
+            pub_date = article.get("pubDate", "")
+            link = article.get("link", "")
+            categories = article.get("category", [])
+            category_str = ", ".join(categories) if categories else ""
+            
+            # Clean up description
+            description = article.get("description", "")
+            if description:
+                # Truncate if too long
+                if len(description) > 200:
+                    description = description[:200] + "..."
+            
+            news_item = f"{i}. {title}\n   📰 Source: {source}"
+            if pub_date:
+                news_item += f" | 📅 {pub_date}"
+            if category_str:
+                news_item += f"\n   🏷️ Categories: {category_str}"
+            if description:
+                news_item += f"\n   {description}"
+            if link:
+                news_item += f"\n   🔗 {link}"
+            
+            news_output.append(news_item)
+        
+        total = data.get("totalResults", len(articles))
+        header = f"📰 Found {total:,} total articles. Showing top {len(articles)}:\n\n"
+        
+        return header + "\n\n".join(news_output)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# Tool registry - maps tool names to functions
+TOOL_FUNCTIONS: Dict[str, callable] = {
+    "get_current_time": get_current_time,
+    "get_current_date": get_current_date,
+    "get_day_of_week": get_day_of_week,
+    "get_calendar_month": get_calendar_month,
+    "get_timestamp": get_timestamp,
+    "get_latest_news": get_latest_news,
+}
+
+# Tool definitions for Ollama
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Get the current time. Use this when the user asks what time it is.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timezone": {
+                        "type": "string",
+                        "description": "Timezone (currently only 'local' is supported)",
+                        "default": "local"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_date",
+            "description": "Get the current date. Use this when the user asks what date or day it is today.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "format": {
+                        "type": "string",
+                        "enum": ["short", "long", "full"],
+                        "description": "Date format: 'short' (2024-01-15), 'long' (January 15, 2024), 'full' (Monday, January 15, 2024)",
+                        "default": "full"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_day_of_week",
+            "description": "Get what day of the week it is (Monday, Tuesday, etc.)",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_calendar_month",
+            "description": "Get a text calendar for a specific month. Useful when user asks to see a calendar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "year": {
+                        "type": "integer",
+                        "description": "The year (defaults to current year)"
+                    },
+                    "month": {
+                        "type": "integer",
+                        "description": "The month (1-12, defaults to current month)"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_timestamp",
+            "description": "Get the current Unix timestamp (seconds since epoch).",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_latest_news",
+            "description": "Fetch the latest news headlines. Use this when user asks for news, current events, or what's happening in the world.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": ["business", "entertainment", "environment", "food", "health", "politics", "science", "sports", "technology", "top", "world"],
+                        "description": "News category to filter by (optional)"
+                    },
+                    "country": {
+                        "type": "string",
+                        "description": "Country code (e.g., 'in' for India, 'us' for USA). Defaults to 'in'",
+                        "default": "in"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of news articles to return (1-10)",
+                        "default": 5
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "Language code for news (e.g., 'en' for English, 'hi' for Hindi). Defaults to 'en'",
+                        "default": "en"
+                    }
+                },
+                "required": []
+            }
+        }
+    }
+]
+
+def execute_tool(tool_name: str, arguments: Dict[str, Any]) -> str:
+    """Execute a tool and return its result."""
+    if tool_name not in TOOL_FUNCTIONS:
+        return f"Error: Unknown tool '{tool_name}'"
+    
+    try:
+        func = TOOL_FUNCTIONS[tool_name]
+        result = func(**arguments)
+        return str(result)
+    except Exception as e:
+        return f"Error executing {tool_name}: {str(e)}"
 
 # Pydantic Models
 class Message(BaseModel):
@@ -65,7 +316,7 @@ async def list_models():
 
 @app.post("/api/chat")
 async def chat_stream(request: ChatRequest):
-    """Stream chat response from Ollama."""
+    """Stream chat response from Ollama with tool support."""
     model_name = get_model_name(request.model_key)
     
     # Convert Pydantic messages to dicts
@@ -77,16 +328,57 @@ async def chat_stream(request: ChatRequest):
 
     async def generate():
         try:
-            # Use synchronous ollama client in async generator (blocking, but simple for local setup)
-            # ideally use asyncio.to_thread or async client if available
-            stream = ollama.chat(
+            # First, make a non-streaming call to check for tool usage
+            initial_response = ollama.chat(
                 model=model_name,
                 messages=messages,
-                stream=True
+                tools=TOOLS,
+                stream=False
             )
-            for chunk in stream:
-                if "message" in chunk and "content" in chunk["message"]:
-                    yield chunk["message"]["content"]
+            
+            # Check if the model wants to use tools
+            if initial_response.get("message", {}).get("tool_calls"):
+                tool_calls = initial_response["message"]["tool_calls"]
+                
+                # Build conversation with tool results
+                updated_messages = messages.copy()
+                updated_messages.append(initial_response["message"])
+                
+                # Process each tool call
+                for tool_call in tool_calls:
+                    tool_name = tool_call["function"]["name"]
+                    tool_args = tool_call["function"].get("arguments", {})
+                    
+                    # Execute the tool
+                    tool_result = execute_tool(tool_name, tool_args)
+                    
+                    # Add tool result to conversation
+                    updated_messages.append({
+                        "role": "tool",
+                        "content": tool_result
+                    })
+                
+                # Get final response with tool results (streaming)
+                final_stream = ollama.chat(
+                    model=model_name,
+                    messages=updated_messages,
+                    stream=True
+                )
+                
+                for chunk in final_stream:
+                    if "message" in chunk and "content" in chunk["message"]:
+                        yield chunk["message"]["content"]
+            else:
+                # No tool calls - make a streaming call for real-time output
+                stream = ollama.chat(
+                    model=model_name,
+                    messages=messages,
+                    stream=True
+                )
+                for chunk in stream:
+                    if "message" in chunk and "content" in chunk["message"]:
+                        yield chunk["message"]["content"]
+                    
         except Exception as e:
             yield f"Error: {str(e)}"
 
