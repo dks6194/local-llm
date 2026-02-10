@@ -1,0 +1,21 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./saved_chats:/app/saved_chats
+      - ./config:/app/config
+      - ollama_data:/root/.ollama
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Kolkata
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+
+networks:
+  default:
+    name: local-llm-network
